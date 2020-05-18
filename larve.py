@@ -8,6 +8,11 @@ class Status(Enum):
     READY = 1
     NOT_READY = 2
 
+# Enum for holding mode values
+class Mode(Enum):
+    DRONE = 1
+    QUEEN = 2
+
 # Default values
 larve_status = Status.NOT_READY 
 larve_verson = '0.0.1'
