@@ -1,3 +1,5 @@
+import argparse
+
 from flask import Flask, jsonify, request, abort
 from enum import Enum
 
@@ -15,6 +17,7 @@ class Mode(Enum):
 
 # Default values
 larve_status = Status.NOT_READY 
+larve_mode   = Mode.DRONE
 larve_verson = '0.0.1'
 
 # What to do on '/healthz'
@@ -22,7 +25,8 @@ larve_verson = '0.0.1'
 def healthz():
     current_health = {
         "status": str(larve_status),
-        "version": larve_verson
+        "version": larve_verson,
+        "mode": str(larve_mode)
     }
     return jsonify(current_health)
 
@@ -30,6 +34,8 @@ def healthz():
 def do_task():
     if not request.json or not 'text' in request.json:
         abort(400)
+    if larve_mode == Mode.QUEEN:
+        abort(400, description='In queen mode, not taking tasks')
     task = request.json.get('text')
     if task:
         print(task)
@@ -39,5 +45,12 @@ def do_task():
 
 if __name__ == '__main__':
     # When we start, set our status
+    parser = argparse.ArgumentParser(description='Hive Larve Daemon')
+    parser.add_argument("--queen", dest='queen', action='store_true')
+    parser.set_defaults(queen=False)
+    args = parser.parse_args()
+
+    if args.queen:
+        larve_mode = Mode.QUEEN
     larve_status = Status.READY
     app.run(debug=True)
