@@ -30,6 +30,18 @@ def healthz():
     }
     return jsonify(current_health)
 
+
+@app.route('/submit_task', methods=['POST'])
+def submit_task():
+    if not request.json or not 'text' in request.json:
+        abort(400)
+    if larve_mode == Mode.DRONE:
+        abort(400, description='In drone mode, not scheduling tasks')
+    task = request.json.get('text')
+    # Send task to a drone...
+    return jsonify({'result': 'OK'})
+
+
 @app.route('/do_task', methods=['POST'])
 def do_task():
     if not request.json or not 'text' in request.json:
