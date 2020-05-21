@@ -20,6 +20,9 @@ larve_status = Status.NOT_READY
 larve_mode   = Mode.DRONE
 larve_verson = '0.0.1'
 
+# A blank drone list
+drones = dict()
+
 # What to do on '/healthz'
 @app.route('/healthz', methods=['GET'])
 def healthz():
@@ -39,6 +42,16 @@ def submit_task():
         abort(400, description='In drone mode, not scheduling tasks')
     task = request.json.get('text')
     # Send task to a drone...
+    return jsonify({'result': 'OK'})
+
+@app.route('/register', methods=['POST'])
+def register():
+    global drones
+    if not request.json or not 'address' in request.json:
+        abort(400)
+    if larve_mode == Mode.DRONE:
+        abort(400, description='In drone mode, not taking registration')
+    drones[request.json.get('address')] = 'drone-' + str(len(drones))
     return jsonify({'result': 'OK'})
 
 
