@@ -1,7 +1,10 @@
 import argparse
+import sys
+from enum import Enum
+import json
 
 from flask import Flask, jsonify, request, abort
-from enum import Enum
+import requests
 
 app = Flask(__name__)
 
@@ -71,11 +74,22 @@ def do_task():
 if __name__ == '__main__':
     # When we start, set our status
     parser = argparse.ArgumentParser(description='Hive Larve Daemon')
-    parser.add_argument("--queen", dest='queen', action='store_true')
+    parser.add_argument("--queen", dest='queen', action='store_true', help="Start this larve in queen mode")
+    parser.add_argument("--queen-host", dest='queenhost', required='--queen' not in sys.argv, help="If running in drone mode, host and port of the queen to register with, example: 127.0.0.1:8080")
+    parser.add_argument("--port", dest='port', nargs='?', const=1, type=int, default=8080, help="Port to run on, default 8080")
     parser.set_defaults(queen=False)
     args = parser.parse_args()
 
     if args.queen:
         larve_mode = Mode.QUEEN
+    else:
+        payload = { "address": "127.0.0.1:" + str(args.port) }
+        headers = { 'Content-Type': 'application/json' }
+        resp = requests.request("POST", 'http://' + args.queenhost + '/register', headers=headers, data = json.dumps(payload))
+        if resp.status_code > 299:
+            print("Could not register to queen")
+            sys.exit(-1)
+        print(f"Registered to {args.queenhost}")
+
     larve_status = Status.READY
-    app.run(debug=True)
+    app.run(debug=True, port=args.port)
