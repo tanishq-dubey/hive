@@ -33,9 +33,12 @@ drones_lock = threading.Lock()
 
 def queen_heartbeat():
     global drones
+    global drones_lock
+
     max_retry = 5
     while True:
         print("Starting heartbeat")
+        drones_lock.acquire()
         to_remove = []
         for k,v in drones.items():
             success = False
@@ -58,44 +61,61 @@ def queen_heartbeat():
         for r in to_remove:
             print(f"removed {r} from drone list")
             drones.pop(r, None)
+
+        drones_lock.release()
         time.sleep(10)
 
 
 # What to do on '/healthz'
 @app.route('/healthz', methods=['GET'])
 def healthz():
+    global drones
     current_health = {
         "status": str(larve_status),
         "version": larve_verson,
         "mode": str(larve_mode)
     }
+
+    if larve_mode == Mode.QUEEN:
+        current_health['drones'] = drones
+
     return jsonify(current_health)
 
 
 @app.route('/submit_task', methods=['POST'])
 def submit_task():
     global drones
+    global drones_lock
     if not request.json or not 'text' in request.json:
         abort(400)
     if larve_mode == Mode.DRONE:
         abort(400, description='In drone mode, not scheduling tasks')
     task = request.json.get('text')
+
     # Send task to a drone...
+    drones_lock.acquire()
     drone_host, drone_name = random.choice(list(drones.items()))
     payload = { "text": task }
     headers = { 'Content-Type': 'application/json' }
     requests.request("POST", 'http://' + drone_host + '/do_task', headers=headers, data=json.dumps(payload))
     print(f"Sent task to {drone_name}")
+    drones_lock.release()
+
     return jsonify({'result': 'OK'})
 
 @app.route('/register', methods=['POST'])
 def register():
     global drones
+    global drones_lock
     if not request.json or not 'address' in request.json:
         abort(400)
     if larve_mode == Mode.DRONE:
         abort(400, description='In drone mode, not taking registration')
+
+    drones_lock.acquire()
     drones[request.json.get('address')] = 'drone-' + str(len(drones))
+    drones_lock.release()
+
     return jsonify({'result': 'OK'})
 
 
