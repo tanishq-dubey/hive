@@ -2,6 +2,9 @@ import argparse
 import sys
 from enum import Enum
 import json
+import random
+import threading
+import time
 
 from flask import Flask, jsonify, request, abort
 import requests
@@ -25,6 +28,38 @@ larve_verson = '0.0.1'
 
 # A blank drone list
 drones = dict()
+drones_lock = threading.Lock()
+
+
+def queen_heartbeat():
+    global drones
+    max_retry = 5
+    while True:
+        print("Starting heartbeat")
+        to_remove = []
+        for k,v in drones.items():
+            success = False
+            count = 1
+            while not success and count < max_retry:
+                try:
+                    print(f"checking {k} ({v})")
+                    requests.get(url= 'http://' + k + '/healthz')
+                    success = True
+                    print(f"check-in from {k} ({v})")
+                except Exception:
+                    print(f"could not check {k} ({v}) on attempt {count}/{max_retry}")
+                    count = count + 1
+                    time.sleep(.5)
+            if count >= max_retry:
+                to_remove.append(k)
+                print(f"marking {k} ({v}) for removal from drone list")
+                print(drones)
+
+        for r in to_remove:
+            print(f"removed {r} from drone list")
+            drones.pop(r, None)
+        time.sleep(10)
+
 
 # What to do on '/healthz'
 @app.route('/healthz', methods=['GET'])
@@ -39,12 +74,18 @@ def healthz():
 
 @app.route('/submit_task', methods=['POST'])
 def submit_task():
+    global drones
     if not request.json or not 'text' in request.json:
         abort(400)
     if larve_mode == Mode.DRONE:
         abort(400, description='In drone mode, not scheduling tasks')
     task = request.json.get('text')
     # Send task to a drone...
+    drone_host, drone_name = random.choice(list(drones.items()))
+    payload = { "text": task }
+    headers = { 'Content-Type': 'application/json' }
+    requests.request("POST", 'http://' + drone_host + '/do_task', headers=headers, data=json.dumps(payload))
+    print(f"Sent task to {drone_name}")
     return jsonify({'result': 'OK'})
 
 @app.route('/register', methods=['POST'])
@@ -79,9 +120,13 @@ if __name__ == '__main__':
     parser.add_argument("--port", dest='port', nargs='?', const=1, type=int, default=8080, help="Port to run on, default 8080")
     parser.set_defaults(queen=False)
     args = parser.parse_args()
+    flask_thread = threading.Thread(target=app.run, kwargs={'port': args.port})
+    flask_thread.start()
+    heartbeat_thread = threading.Thread(target=queen_heartbeat)
 
     if args.queen:
         larve_mode = Mode.QUEEN
+        heartbeat_thread.start()
     else:
         payload = { "address": "127.0.0.1:" + str(args.port) }
         headers = { 'Content-Type': 'application/json' }
@@ -92,4 +137,8 @@ if __name__ == '__main__':
         print(f"Registered to {args.queenhost}")
 
     larve_status = Status.READY
-    app.run(debug=True, port=args.port)
+
+
+    flask_thread.join()
+    if args.queen:
+        heartbeat_thread.join()
