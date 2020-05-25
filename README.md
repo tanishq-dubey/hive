@@ -14,7 +14,7 @@ Our Larve, or the daemon running on every node, is essentially an HTTP server.
 It exposes an API, and based on the requests that come into this API, it does
 things on the node. In our case, starting and stopping containers. Since we are
 writing a very simple version of Kubernetes, we can get away with using JSON on
-our API, rather something more efficicent like Protobuf.
+our API, rather something more efficient like Protobuf.
 
 Let's begin by writing the most basic Larve, one that does two things:
 
@@ -105,7 +105,7 @@ Ok, so we have something that's not so useful, but it is a critical building blo
 for our "Hive" system.  You see, this is basically what the Kubernetes Kubelet is:
 A tiny application that maintains/reports it's status and takes orders from some
 higher authority, which is....the kubelet. Specifically, we will change our larve
-to become one of two things: a drone, the worker unit, or a queen, the commmanding
+to become one of two things: a drone, the worker unit, or a queen, the commanding
 unit.
 
 ## Part 2: Of Drones and Queens
@@ -161,11 +161,11 @@ Drones
 
 With this list of duties we can see that Drones are quite dumb. They only care about
 themselves and nothing else. In order for a drone to be useful in any way, there must
-be a queen ordering the drone to do something. With this in mind, we can delcare that
+be a queen ordering the drone to do something. With this in mind, we can declare that
 the simplest Hive would consist of one queen and one drone. The user would interface
 with the queen to provide tasks, and the queen would hand those tasks to the drone.
 Do note that the queen is not doing any work here. All the queen is responsible for is
-maintining the state of the Hive, and like in stereotypical royal fashion, not doing
+maintaining the state of the Hive, and like in stereotypical royal fashion, not doing
 the dirty work. Let's begin our work by finishing the Drone implementation, since we
 are nearly done with it:
 
@@ -234,7 +234,7 @@ Moving on to the queen implementation, we need to add a few items to our larve.
 First, we should add a `submit_task` endpoint. This will be the external API
 that a user can call in order to give the Hive things to do. They could call
 `do_task` on an individual drone if they really wanted, but that would bypass
-all control from the queens, and wouldn't be recomended (a good improvement is
+all control from the queens, and wouldn't be recommended (a good improvement is
 to ensure `do_task` calls only come from the queen). The `submit_task` would look
 something like this:
 
@@ -285,7 +285,7 @@ easier to do tasks in parallel with serving the API endpoints.
 In this part we want to accomplish three tasks:
 
  1. Have drones register with queens, and have queens keep a list of drones
- 2. Have queeens give a task to a random drone.
+ 2. Have queens give a task to a random drone.
  3. Have queens heartbeat with drones
 
 
@@ -300,7 +300,7 @@ sort of service discovery, which is likely out of the scope of this series of po
 but may come as an addon post far in the future. Of course, doing drone->queen
 registration does have its downsides. For one, it demands that our queen's host:port
 does not change, however this is generally solved by putting our queen(s) behind a
-static loadbalancer host:port, and letting the individual queens change as much as
+static load-balancer host:port, and letting the individual queens change as much as
 they want. We also need to have the queens keep a list of the drones that are available.
 For now we will make two assumptions:
 
@@ -311,10 +311,10 @@ These are important assumptions to make. Firstly, drones can a tons of metadata.
 kubernetes, worker metadata includes things like version, capacity (CPU/memory), name,
 kernel version, IP ranges, and so on. We will eventually incorporate things like capacity
 once we get to scheduling, but for now, just host:port, so we know where to send commands
-will suffice. In additon, the assumption of only one queen is hugely important. If we
+will suffice. In addition, the assumption of only one queen is hugely important. If we
 have multiple queens, we will need to make sure that all the queens have the same
-list of drones: a concensus problem. Kubernetes solves this by using `etcd`, a
-distributed key-value store that performns concensus on its data, so everyone sees the
+list of drones: a consensus problem. Kubernetes solves this by using `etcd`, a
+distributed key-value store that performs consensus on its data, so everyone sees the
 same version of it. If we had multiple queens, we would need to do the same, either
 use something like `etcd`, or implement this ourselves. For now we will bypass
 this problem, but it will come back around sooner than we think.
@@ -324,7 +324,7 @@ The next part will be quite simple, once the queen gets a job on the
 task information.
 
 Finally we want our queens to heartbeat with our drones. The primary purpose of this, for now,
-is to know wheather a drone is available or not. By heartbeating with every drone in
+is to know whether a drone is available or not. By heartbeating with every drone in
 its list, the queen can remove drones that have been unavailable for too long, ensuring
 they don't get tasks assigned to them. We also want to setup heartbeating so we can modify
 our code to do things in parallel. Heartbeating will be used later on to also keep track
@@ -400,7 +400,7 @@ for example: `127.0.0.1:5000: "drone-1"`.
 
 With this done, we need to modify the drone logic such that it registers with the queen
 on start up. To do that we will add an additional argument to our Larve so that if the
-larve is a drone, it will require an argument for the queen host and port. In additon,
+larve is a drone, it will require an argument for the queen host and port. In addition,
 we should add an argument to be able to change the port the Larve runs on, so we don't
 have port conflicts when running multiple drones. Let's see these changes:
 
@@ -518,10 +518,10 @@ We now have a basic distributed system, but there is one issue, what if a drone 
 The queen should not be sending commands to a drone that is dead. To prevent this from happening, we will
 implement heartbeating in the queen.
 
-How this will work is quite simple: once a drone is registered in the queen's dictionary, in a seperate thread,
+How this will work is quite simple: once a drone is registered in the queen's dictionary, in a separate thread,
 the queen will go through this list every _n_ seconds and call the `/healthz` endpoint on the drones. If the
 drones do not respond in a timely manner in _m_ attempts, the queen will remove them from their registration
-list. The first thing we want to do for this implementation is move our webserver to a seperate thread:
+list. The first thing we want to do for this implementation is move our webserver to a separate thread:
 
 ```diff
 diff --git a/larve.py b/larve.py
@@ -604,8 +604,8 @@ index 15b9a07..86ec532 100644
 We've accomplished a lot in the last code diff. We are now running multiple tasks
 in a single program. Specifically, we are running our API server and our heartbeating
 method in two threads, so that we can accept tasks and check on our drones -- in the
-queens -- at the same time. Looking at our `queen_hearbeat` function, we can see that
-it iterates over the entire list of drones and calls the `/healtz` endpoint on
+queens -- at the same time. Looking at our `queen_heartbeat` function, we can see that
+it iterates over the entire list of drones and calls the `/healthz` endpoint on
 them. If there is a problem reaching the drone, we try again for `max_retry`
 times, and if we get multiple failures, we mark the drone for deletion. After this,
 we go to sleep and try heartbeating later.
@@ -716,7 +716,7 @@ notice a delay in the server responding to us, ensuring the locking is working.
 Part 4 will be a short one, we will clean up the code and add proper logging.
 All this will prepare us for part 5, which will fix an even bigger problem in
 our system: what happens when the queen dies? For this we will need multiple
-queen, and some sort of concensus between them...
+queen, and some sort of consensus between them...
 
 ## Part 4: Good Will Cleaning
 
@@ -727,7 +727,7 @@ There are two major goals we want to accomplish:
 
 Since a lot of the diffs here won't really help, the best course of action is 
 to post two code blocks: our current state, and a cleaned state, which we will
-use starting in part 5. So without futher ado:
+use starting in part 5. So without further ado:
 
 ### The Current State of the Sode
 ```python
@@ -1177,7 +1177,7 @@ if __name__ == "__main__":
 ```
 
 Some stuff has changed. Specifically, we have run the code though the `yapf`
-formatter, just to get a bit of standarized cleanup. We've also implemented
+formatter, just to get a bit of standardized cleanup. We've also implemented
 structured logging, which is our route of going about our log cleanup. Finally
 we've used `gevent` with monkey patching to cleanup how we start the Flask
 API server and and cleanup Flask logging. There are other minor changes, a
