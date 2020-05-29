@@ -36,6 +36,18 @@ class Mode(Enum):
     QUEEN = 2
 
 
+# A member of a Raft group can be in one of three states
+# Everyone starts in the follower state
+class RaftState(Enum):
+    FOLLOWER = 1
+    CANDIDATE = 2
+    LEADER = 3
+
+
+# The unix time (in seconds) we last heard from someone
+last_heartbeat = int(time.time())
+
+
 # Create the Flask API server
 app = Flask(__name__)
 
@@ -46,6 +58,10 @@ log = structlog.get_logger()
 larve_status = Status.NOT_READY
 larve_mode = Mode.DRONE
 larve_verson = '0.0.1'
+raft_state = RaftState.FOLLOWER
+
+# Our leader timeout is anywhere between 5 and 15 seconds
+raft_leader_timeout = random.randint(5, 15)
 
 # A blank drone list
 drones = dict()
@@ -93,19 +109,38 @@ def queen_heartbeat():
         time.sleep(10)
 
 
+def raft():
+    global raft_state
+    while True:
+        if raft_state == RaftState.FOLLOWER:
+            if (int(time.time()) - last_heartbeat) > raft_leader_timeout:
+                raft_state = RaftState.CANDIDATE
+                log.info("Changing raft state", previous=str(RaftState.FOLLOWER), next=str(RaftState.CANDIDATE))
+            else:
+                time.sleep(1)
+
+
 # What to do on '/healthz'
 @app.route('/healthz', methods=['GET'])
 def healthz():
     global drones
+    global last_heartbeat
+
+    last_heartbeat = int(time.time())
+
     current_health = {
         "status": str(larve_status),
         "version": larve_verson,
-        "mode": str(larve_mode)
+        "mode": str(larve_mode),
+        "last_heartbeat": last_heartbeat
     }
 
     # If we are a queen, show the drones we know about
+    # We also care about the raft state
     if larve_mode == Mode.QUEEN:
         current_health['drones'] = drones
+        current_health['raft_state'] = str(raft_state)
+
 
     return jsonify(current_health)
 
@@ -258,10 +293,19 @@ if __name__ == "__main__":
     log.info("started thread", name="api-server")
 
     if args.queen:
+        # Start building a raft with other queens
+        raft_state = RaftState.FOLLOWER
+        raft_thread = threading.Thread(target=raft)
+
         # Start queen heartbeating
         larve_mode = Mode.QUEEN
         heartbeat_thread = threading.Thread(target=queen_heartbeat)
+
+        raft_thread.start()
         heartbeat_thread.start()
+
+        thread_list.append(raft_thread)
+        log.info("started thread", name="raft", timeout=raft_leader_timeout)
         thread_list.append(heartbeat_thread)
         log.info("started thread", name="queen-heartbeat")
     else:
