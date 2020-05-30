@@ -1,3 +1,3 @@
 #!/bin/bash
 
-xpanes -sstc "./larve.py --queen --port {}" {8080..8084}
+xpanes -sstc "python3 ./start_queens.py {} 8080 8084" {8080..8084}

@@ -15,6 +15,7 @@ import struct
 import sys
 import threading
 import time
+import math
 
 from enum import Enum
 
@@ -59,13 +60,17 @@ larve_status = Status.NOT_READY
 larve_mode = Mode.DRONE
 larve_verson = '0.0.1'
 raft_state = RaftState.FOLLOWER
+interface = ""
 
 # Our leader timeout is anywhere between 5 and 15 seconds
-raft_leader_timeout = random.randint(5, 15)
+raft_election_timeout = random.randint(5, 15)
 
 # A blank drone list
 drones = dict()
 drones_lock = threading.Lock()
+
+# A blank queen list
+queens = []
 
 
 # Function for the heartbeat thread
@@ -76,48 +81,93 @@ def queen_heartbeat():
     max_retry = 5
     # We always want to be heartbeating
     while True:
-        log.info("starting task", task="heartbeat")
-        drones_lock.acquire()
-        to_remove = []
-        for k, v in drones.items():
-            success = False
-            count = 1
-            while not success and count < max_retry:
-                try:
-                    log.info("heartbeating with drone", host=k, name=v)
-                    requests.get(url='http://' + k + '/healthz')
-                    success = True
-                    log.info("got heartbeat with drone", host=k, name=v)
-                except Exception:
-                    log.warning("could not reach drone",
-                                host=k,
-                                name=v,
-                                attempt=count,
-                                max_attempt=max_retry)
-                    count = count + 1
-                    time.sleep(.5)
-            if count >= max_retry:
-                to_remove.append(k)
-                log.warning("marking drone for removal", host=k, name=v)
+        if raft_state == RaftState.LEADER:
+            log.info("starting task", task="drone heartbeat")
+            drones_lock.acquire()
+            to_remove = []
+            for k, v in drones.items():
+                success = False
+                count = 1
+                while not success and count < max_retry:
+                    try:
+                        log.info("heartbeating with drone", host=k, name=v)
+                        send_heartbeat(k)
+                        success = True
+                        log.info("got heartbeat with drone", host=k, name=v)
+                    except Exception:
+                        log.warning("could not reach drone",
+                                    host=k,
+                                    name=v,
+                                    attempt=count,
+                                    max_attempt=max_retry)
+                        count = count + 1
+                        time.sleep(.5)
+                if count >= max_retry:
+                    to_remove.append(k)
+                    log.warning("marking drone for removal", host=k, name=v)
 
-        for r in to_remove:
-            log.warning("removed drone from list", host=r)
-            drones.pop(r, None)
+            for r in to_remove:
+                log.warning("removed drone from list", host=r)
+                drones.pop(r, None)
 
-        drones_lock.release()
-        log.info("completed task", task="heartbeat")
+            drones_lock.release()
+            log.info("completed task", task="drone heartbeat")
         time.sleep(10)
 
 
 def raft():
     global raft_state
+
+    # We're always doing raft
     while True:
+
         if raft_state == RaftState.FOLLOWER:
-            if (int(time.time()) - last_heartbeat) > raft_leader_timeout:
+            if (int(time.time()) - last_heartbeat) > raft_election_timeout:
                 raft_state = RaftState.CANDIDATE
                 log.info("Changing raft state", previous=str(RaftState.FOLLOWER), next=str(RaftState.CANDIDATE))
             else:
                 time.sleep(1)
+
+        if raft_state == RaftState.CANDIDATE:
+            log.info("starting vote pool")
+            num_votes = sum(do_list_threaded(send_vote_request_thread, queens))
+            log.info("got votes", count = num_votes, needed=int(math.ceil(len(queens)/2.0)))
+            # Check to see if we have a majority of votes
+            if num_votes > int(math.ceil(len(queens)/2.0)):
+                log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.LEADER))
+                raft_state = RaftState.LEADER
+
+        if raft_state == RaftState.LEADER:
+            log.info("doing raft task", task="leader heartbeat")
+            do_list_threaded(send_heartbeat_thread, queens)
+            log.info("completed raft task", task="leader heartbeat")
+            time.sleep(3)
+
+
+def do_list_threaded(func, to_do):
+    ret_list = [0] * len(to_do)
+    do_thread_list = []
+    for i in range(len(to_do)):
+        t = threading.Thread(target=func, args=[to_do[i], i, ret_list])
+        t.start()
+        do_thread_list.append(t)
+
+    for t in do_thread_list:
+        t.join()
+
+    return ret_list
+
+
+def send_heartbeat_thread(host, idx, ret_list):
+    send_heartbeat(host)
+
+
+def send_heartbeat(host):
+    try:
+        requests.get(url='http://' + host + '/healthz')
+    except Exception:
+        log.warning("could not reach larve to heartbeat",
+                    host=host)
 
 
 # What to do on '/healthz'
@@ -143,6 +193,58 @@ def healthz():
 
 
     return jsonify(current_health)
+
+
+def send_vote_request_thread(voter_queen, idx, ret_list):
+    val = send_vote_request(voter_queen)
+    ret_list[idx] = val
+
+
+def send_vote_request(voter_queen):
+    log.info("sending vote request", queen=voter_queen)
+    self_ip = get_ip_of_interface(interface)
+    payload = {"candidate": self_ip + ":" + str(args.port)}
+    headers = {'Content-Type': 'application/json'}
+
+    try:
+        resp = requests.post('http://' + voter_queen + '/request_vote',
+                             headers=headers,
+                             data=json.dumps(payload))
+    except Exception as e:
+        log.error("could request vote with queen",
+                  queen=voter_queen,
+                  error=e)
+        return 0
+
+    if resp.status_code > 399:
+        log.error("could request vote with queen",
+                  queen=voter_queen,
+                  response=resp.text,
+                  code=resp.status_code)
+        return 0
+
+    if resp.status_code > 299:
+        log.info("queen rejected vote",
+                 queen=voter_queen)
+        return 0
+
+    log.info("got vote from queen", queen=voter_queen)
+
+    return 1
+
+
+@app.route('/request_vote', methods=['POST'])
+def request_vote():
+    global last_heartbeat
+
+    last_heartbeat = int(time.time())
+
+    if not request.json or not 'candidate' in request.json:
+        abort(400)
+
+    log.info("got request for vote", candidate=request.json.get('candidate'))
+
+    return jsonify({'result': 'OK'})
 
 
 # Submit a task to the queen to be assigned to a drone
@@ -265,11 +367,19 @@ if __name__ == "__main__":
         "If running in drone mode, host and port of the queen to register with, example: 127.0.0.1:8080"
     )
     parser.add_argument(
+        "--queen-list",
+        dest="queenlist",
+        nargs='+',
+        required='--queen' in sys.argv,
+        help=
+        "If running in queen mode, list of all the queens, example: 127.0.0.1:8081 127.0.0.1:8082..."
+    )
+    parser.add_argument(
         "--interface",
         dest="net_interface",
-        required='--queen' not in sys.argv,
+        required=True,
         help=
-        "If running in drone mode, network interface the drone should use, example: enp5s0"
+        "Network interface the larve should use, example: enp5s0"
     )
     parser.add_argument("--port",
                         dest="port",
@@ -285,14 +395,19 @@ if __name__ == "__main__":
     if args.queen:
         larve_mode = Mode.QUEEN
 
+    interface = args.net_interface
+
     # Start APi server
     http_server = WSGIServer(('', args.port), app, log=None)
     http_thread = threading.Thread(target=http_server.serve_forever)
     http_thread.start()
     thread_list.append(http_thread)
-    log.info("started thread", name="api-server")
+    log.info("started thread", name="api-server", port=args.port)
 
     if args.queen:
+        queens = args.queenlist
+        log.info("in queen mode", queen_list=queens)
+
         # Start building a raft with other queens
         raft_state = RaftState.FOLLOWER
         raft_thread = threading.Thread(target=raft)
@@ -305,7 +420,7 @@ if __name__ == "__main__":
         heartbeat_thread.start()
 
         thread_list.append(raft_thread)
-        log.info("started thread", name="raft", timeout=raft_leader_timeout)
+        log.info("started thread", name="raft", election_timeout=raft_election_timeout)
         thread_list.append(heartbeat_thread)
         log.info("started thread", name="queen-heartbeat")
     else:
