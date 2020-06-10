@@ -1934,9 +1934,13 @@ we become a candidate, we begin to collect votes using our `do_list_threaded` fu
 pass this our `send_vote_request_thread` as the function to map on and the list of queens as
 the things to map. We then take the resultant list and find the sum of that. The reason we
 do this is because if a queen voted for us, we return a 1, so to found out how many votes we 
-got, all we need to do is sum our votes array. Next, in Raft, we can tell if we won a election
+got, all we need to do is sum our votes array. 
+
+Next, in Raft, we can tell if we won a election
 simply by seeing if we got a majority of the votes, so even if some queens didn't respond to our
-election, so long as a majority did we can declare ourself as leader. If we did receive a majority
+election, so long as a majority did we can declare ourself as leader. 
+
+If we did receive a majority
 of the votes, then we make the transition to the leader state. In the leader state, we don't do much
 yet, we simply send heartbeats to the queens using the same `do_list_threaded` and the `send_heartbeat_thread`
 function.
@@ -2019,8 +2023,10 @@ Now, not much really happened here, we just added the if statement:
 ```
 
 And indented the rest of the code to be within it. This just means
-only the leader queen heartbeats with the drones. This was primarily added
-for a cool experiment we can do. If we start up multiple queens, we can see
+only the leader queen heartbeats with the drones. 
+
+This was primarily added for a cool experiment we can do. 
+If we start up multiple queens, we can see
 the leader election happen and the leader queen begin heartbeating. Because on
 every heartbeat we reset the `raft_election_timeout` the other queens remain in
 follower mode. If we then kill the leader queen, we will notice one of the other 
@@ -2075,3 +2081,408 @@ Nothing crazy here. Since this is simple tooling, I won't go through trying to u
 That is enough for this commit, we will continue part 5 in the next sub section, where
 we fix a bug in our implementation: split brain, or what happens when 2 leaders 
 both win the election.
+
+### Dr. Jekyll and Mr. Hyde
+
+Suppose we start up in a particular scenario where two of our queens have the
+same or similar election timeouts and so become candidates at basically the same
+time, what would happen in this case? Well, in our current implementation:
+  - Both candidate queens would send out vote requests to the other queens
+  - The other follower queens would reply successfully (the only error conditions are
+  if we don't have the correct body or if are down)
+  - Both candidate queens get a "majority" of replies and so assume they are the leader
+  - We now have two leaders
+
+Uh-oh. 
+
+Two leaders is bad for our cluster because it means that each leader queen can say that
+they are right and overwrite the other leader queen, even if they have bad data! So how
+do we fix this? Well we can incorporate some things we have in leader elections in the
+real world, such as when we vote for someone running for a government position.
+
+When we vote in the real world, we -- generally speaking -- only vote for one candidate,
+so we should do the same here. However, there is one nuance to this rule. When we vote
+for government office, we vote for one person _per term_, otherwise (in the strictest 
+definition of the election rules) we could vote for one person whenever we want. Since
+computers are sticklers for rules, we should also implement terms for our elections.
+
+Here's how we do this:
+
+```diff
+diff --git a/larve.py b/larve.py
+index df5e705..87c0676 100755
+--- a/larve.py
++++ b/larve.py
+@@ -21,7 +21,7 @@ from enum import Enum
+
+ import requests
+ import structlog
+-from flask import Flask, jsonify, request, abort
++from flask import Flask, jsonify, request, abort, Response
+ from gevent.pywsgi import WSGIServer
+
+
+@@ -59,11 +59,13 @@ log = structlog.get_logger()
+ larve_status = Status.NOT_READY
+ larve_mode = Mode.DRONE
+ larve_verson = '0.0.1'
+-raft_state = RaftState.FOLLOWER
+ interface = ""
+
+ # Our leader timeout is anywhere between 5 and 15 seconds
+ raft_election_timeout = random.randint(5, 15)
++raft_state = RaftState.FOLLOWER
++raft_term = 0
++raft_lock = threading.Lock()
+
+ # A blank drone list
+ drones = dict()
+@@ -117,6 +119,9 @@ def queen_heartbeat():
+
+ def raft():
+     global raft_state
++    global raft_term
++    global raft_lock
++    global last_heartbeat
+
+     # We're always doing raft
+     while True:
+@@ -130,13 +135,22 @@ def raft():
+
+         if raft_state == RaftState.CANDIDATE:
+             log.info("starting vote pool")
++            raft_lock.acquire()
++            raft_term = raft_term + 1
++            raft_lock.release()
+             num_votes = sum(do_list_threaded(send_vote_request_thread, queens))
+-            log.info("got votes", count = num_votes, needed=int(math.ceil(len(queens)/2.0)))
++            # Vote for ourselves
++            num_votes = num_votes + 1
++            last_heartbeat = int(time.time())
++            votes_needed = int(math.ceil((len(queens) + 1)/2.0))
++            log.info("got votes", count = num_votes, needed=votes_needed, term=raft_term)
+             # Check to see if we have a majority of votes
+-            if num_votes > int(math.ceil(len(queens)/2.0)):
++            if num_votes > votes_needed:
+                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.LEADER))
+                 raft_state = RaftState.LEADER
+-
++            else:
++                log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
++                raft_state = RaftState.FOLLOWER
+         if raft_state == RaftState.LEADER:
+             log.info("doing raft task", task="leader heartbeat")
+             do_list_threaded(send_heartbeat_thread, queens)
+@@ -201,9 +215,14 @@ def send_vote_request_thread(voter_queen, idx, ret_list):
+
+
+ def send_vote_request(voter_queen):
+-    log.info("sending vote request", queen=voter_queen)
++    global raft_term
++
++    log.info("sending vote request", queen=voter_queen, term=raft_term)
+     self_ip = get_ip_of_interface(interface)
+-    payload = {"candidate": self_ip + ":" + str(args.port)}
++    payload = {
++            "candidate": self_ip + ":" + str(args.port),
++            "term" : raft_term
++            }
+     headers = {'Content-Type': 'application/json'}
+
+     try:
+@@ -236,15 +255,29 @@ def send_vote_request(voter_queen):
+ @app.route('/request_vote', methods=['POST'])
+ def request_vote():
+     global last_heartbeat
++    global raft_term
++    global raft_lock
+
+     last_heartbeat = int(time.time())
+
+     if not request.json or not 'candidate' in request.json:
+         abort(400)
+
+-    log.info("got request for vote", candidate=request.json.get('candidate'))
++    if not request.json or not 'term' in request.json:
++        abort(400)
+
+-    return jsonify({'result': 'OK'})
++    candidate = request.json.get('candidate')
++    term = request.json.get('term')
++
++    raft_lock.acquire()
++    log.info("got request for vote", candidate=candidate, term=term, current_term=raft_term)
++    if term > raft_term:
++        raft_term = term
++        raft_lock.release()
++        return jsonify({'result': 'OK'})
++
++    raft_lock.release()
++    return Response("{'reason': 'invalid term'}", status=300, mimetype='application/json')
+
+
+ # Submit a task to the queen to be assigned to a drone
+ ```
+
+Adding the term is simple, we add the global variable and we initialize it to zero.
+We also added a lock for anything we do in raft, so we can make sure our variables are
+not being changed in multiple places, specifically the term variable.
+ 
+We then modify our raft function so that it is aware of our raft lock, raft term, and
+last heartbeat time. Then, when we become a candidate, the first thing we do is increase
+our raft term to start the election. We then go out to and get votes from everyone with
+our new term. Once we collect our votes, we also vote for ourselves, just like any good
+politician would. Along with voting for ourselves, we reset our last heartbeat time 
+just like we would if we got a vote request from another queen. Just like last time, if
+we have enough votes, we switch from being a candidate to being a leader, and if we
+lost the election we go back to being a follower.
+
+A modification was made to when send votes to include the raft term, simple enough.
+Finally, we modify the `request_vote` function to also be aware of our raft term and
+raft lock. What we want to do is increment our raft term if someone sends us a raft term
+higher than ours. If we see a raft term that matches ours, we reject the vote, as we
+already have a leader with our current raft term.
+
+With these changes, we've basically implemented leader election. The last thing we want to
+do, in order to be fully consistent with the raft protocol is to abort our election if we
+get a message from someone else saying they are the leader. After that we can reduce our
+election timeouts from seconds to milliseconds and be fully raft.
+
+To get this last part done, we want to switch from using the heartbeat function to the
+actual raft `append_entries` function. We will be using this function in the future to actually
+raft data between queens, but for now, we can use it as a heartbeat. Let's implement this:
+
+```diff
+diff --git a/larve.py b/larve.py
+index 87c0676..5888110 100755
+--- a/larve.py
++++ b/larve.py
+@@ -45,10 +45,6 @@ class RaftState(Enum):
+     LEADER = 3
+
+
+-# The unix time (in seconds) we last heard from someone
+-last_heartbeat = int(time.time())
+-
+-
+ # Create the Flask API server
+ app = Flask(__name__)
+
+@@ -62,7 +58,7 @@ larve_verson = '0.0.1'
+ interface = ""
+
+ # Our leader timeout is anywhere between 5 and 15 seconds
+-raft_election_timeout = random.randint(5, 15)
++raft_election_timeout = random.randint(150, 300)
+ raft_state = RaftState.FOLLOWER
+ raft_term = 0
+ raft_lock = threading.Lock()
+@@ -75,6 +71,14 @@ drones_lock = threading.Lock()
+ queens = []
+
+
++def get_time_millis():
++    return int(round(time.time() * 1000))
++
++
++# The unix time (in seconds) we last heard from someone
++last_heartbeat = get_time_millis()
++
++
+ # Function for the heartbeat thread
+ def queen_heartbeat():
+     global drones
+@@ -84,7 +88,6 @@ def queen_heartbeat():
+     # We always want to be heartbeating
+     while True:
+         if raft_state == RaftState.LEADER:
+-            log.info("starting task", task="drone heartbeat")
+             drones_lock.acquire()
+             to_remove = []
+             for k, v in drones.items():
+@@ -113,7 +116,6 @@ def queen_heartbeat():
+                 drones.pop(r, None)
+
+             drones_lock.release()
+-            log.info("completed task", task="drone heartbeat")
+         time.sleep(10)
+
+
+@@ -122,40 +124,49 @@ def raft():
+     global raft_term
+     global raft_lock
+     global last_heartbeat
++    global raft_election_timeout
+
+     # We're always doing raft
+     while True:
+
+         if raft_state == RaftState.FOLLOWER:
+-            if (int(time.time()) - last_heartbeat) > raft_election_timeout:
++            if (get_time_millis() - last_heartbeat) > raft_election_timeout:
+                 raft_state = RaftState.CANDIDATE
+                 log.info("Changing raft state", previous=str(RaftState.FOLLOWER), next=str(RaftState.CANDIDATE))
+             else:
+-                time.sleep(1)
++                time.sleep(10/1000.0)
+
+         if raft_state == RaftState.CANDIDATE:
+             log.info("starting vote pool")
++            raft_election_timeout = random.randint(150,300)
+             raft_lock.acquire()
+             raft_term = raft_term + 1
+             raft_lock.release()
+             num_votes = sum(do_list_threaded(send_vote_request_thread, queens))
+             # Vote for ourselves
+             num_votes = num_votes + 1
+-            last_heartbeat = int(time.time())
++            last_heartbeat = get_time_millis()
+             votes_needed = int(math.ceil((len(queens) + 1)/2.0))
+             log.info("got votes", count = num_votes, needed=votes_needed, term=raft_term)
++
++            # If we had aborted the election early, then we can ignore all our votes
++            raft_lock.acquire()
++            if raft_state == RaftState.FOLLOWER:
++                num_votes = 0
++            raft_lock.release()
++
+             # Check to see if we have a majority of votes
++            raft_lock.acquire()
+             if num_votes > votes_needed:
+                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.LEADER))
+                 raft_state = RaftState.LEADER
+             else:
+                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
+                 raft_state = RaftState.FOLLOWER
++            raft_lock.release()
+         if raft_state == RaftState.LEADER:
+-            log.info("doing raft task", task="leader heartbeat")
+-            do_list_threaded(send_heartbeat_thread, queens)
+-            log.info("completed raft task", task="leader heartbeat")
+-            time.sleep(3)
++            do_list_threaded(send_append_entries_thread, queens)
++            time.sleep(100/1000.0)
+
+
+ def do_list_threaded(func, to_do):
+@@ -190,7 +201,7 @@ def healthz():
+     global drones
+     global last_heartbeat
+
+-    last_heartbeat = int(time.time())
++    last_heartbeat = get_time_millis()
+
+     current_health = {
+         "status": str(larve_status),
+@@ -209,6 +220,63 @@ def healthz():
+     return jsonify(current_health)
+
+
++def send_append_entries_thread(host, idx, ret_list):
++     send_append_entries(host)
++
++
++def send_append_entries(host):
++    self_ip = get_ip_of_interface(interface)
++    payload = {
++        "leader": self_ip + ":" + str(args.port),
++        "term": raft_term,
++        "entries": []
++        }
++    headers = {'Content-Type': 'application/json'}
++    try:
++        requests.post('http://' + host + '/append_entries',
++                             headers=headers,
++                             data=json.dumps(payload))
++    except Exception as e:
++        pass
++
++
++@app.route('/append_entries', methods=['POST'])
++def append_entries():
++    global raft_term
++    global raft_state
++    global raft_lock
++    global last_heartbeat
++
++    if not request.json or not 'leader' in request.json:
++        abort(400)
++    if not request.json or not 'term' in request.json:
++        abort(400)
++    if not request.json or not 'entries' in request.json:
++        abort(400)
++
++    raft_lock.acquire()
++    if raft_state == RaftState.CANDIDATE:
++        # We are a candidate and we got an append entries
++        entry_term = int(request.json.get('term'))
++        leader = request.json.get('leader')
++        if entry_term >= raft_term:
++            log.info("Aborting candidate state", term=entry_term, leader=leader)
++            last_heartbeat = get_time_millis()
++            raft_term = entry_term
++            raft_state = RaftState.FOLLOWER
++            log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
++            raft_lock.release()
++            return jsonify({'result': 'OK'})
++        else:
++            raft_lock.release()
++            abort(400)
++
++    # If we had entries, do stuff with them here
++    last_heartbeat = get_time_millis()
++    raft_lock.release()
++    return jsonify({'result': 'OK'})
++
++
+ def send_vote_request_thread(voter_queen, idx, ret_list):
+     val = send_vote_request(voter_queen)
+     ret_list[idx] = val
+@@ -258,7 +326,7 @@ def request_vote():
+     global raft_term
+     global raft_lock
+
+-    last_heartbeat = int(time.time())
++    last_heartbeat = get_time_millis()
+
+     if not request.json or not 'candidate' in request.json:
+         abort(400)
+```
+
+Our `append_entries` function is pretty simple. If we are in a candidate state and
+we got an append entry request from someone who has a higher or equal term than us,
+we know that they are the leader, so we take their term, set our state to follower,
+and update our heartbeat time. In any other state, we just update our heartbeat
+for now. We also add the corresponding send and send thread functions for this.
+
+We've also added a helper function for getting the time in milliseconds. With that,
+we've also changed all our times from seconds to milliseconds. Now, we've changed
+our election timeout to be between 150 and 300 milliseconds versus our previous 5 to
+15 seconds. We've also updated any `time.sleep()` calls we have to match our
+millisecond change. The eagle eyed reader would also spot the addition of this 
+line:
+
+```diff
++            raft_election_timeout = random.randint(150,300)
+```
+
+We do this right after we become a candidate. The reasoning behind randomizing our
+election timeout every time we start an election is to add entropy between elections,
+reducing the chance that an election might fail in lockstep with another candidate.
+
+All this in tow, we can now say that our leader election is complete! Running our
+queens using our helper scripts we see everything come up and nearly instantly elect
+a leader queen. If we were to kill that queen, then we would see that some other
+queen would initiate an election with a new term and try and become leader. Fault
+tolerant indeed! This is a huge milestone for our application, as we can start the
+last part of our queen system: keeping data consistent between queens. Once we can
+accomplish that, we can begin sending tasks from the queens to our drones,
+communicate to the other queens what that task was, and keep a record of the state
+of our drones, all while remaining fault tolerant. 
+
+Some might ask why we are dealing with the problem of fault tolerance first, and
+that is a fair question. The answer is that sending a task, of any kind, to a drone
+is relatively easy. We're taking care of the difficult tasks first, so that when 
+we start doing the more exciting things even faster.
+
+In the next section, we will begin to transfer data between queens.
