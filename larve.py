@@ -21,7 +21,7 @@ from enum import Enum
 
 import requests
 import structlog
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request, abort, Response
 from gevent.pywsgi import WSGIServer
 
 
@@ -59,11 +59,13 @@ log = structlog.get_logger()
 larve_status = Status.NOT_READY
 larve_mode = Mode.DRONE
 larve_verson = '0.0.1'
-raft_state = RaftState.FOLLOWER
 interface = ""
 
 # Our leader timeout is anywhere between 5 and 15 seconds
 raft_election_timeout = random.randint(5, 15)
+raft_state = RaftState.FOLLOWER
+raft_term = 0
+raft_lock = threading.Lock()
 
 # A blank drone list
 drones = dict()
@@ -117,6 +119,9 @@ def queen_heartbeat():
 
 def raft():
     global raft_state
+    global raft_term
+    global raft_lock
+    global last_heartbeat
 
     # We're always doing raft
     while True:
@@ -130,13 +135,22 @@ def raft():
 
         if raft_state == RaftState.CANDIDATE:
             log.info("starting vote pool")
+            raft_lock.acquire()
+            raft_term = raft_term + 1
+            raft_lock.release()
             num_votes = sum(do_list_threaded(send_vote_request_thread, queens))
-            log.info("got votes", count = num_votes, needed=int(math.ceil(len(queens)/2.0)))
+            # Vote for ourselves
+            num_votes = num_votes + 1
+            last_heartbeat = int(time.time())
+            votes_needed = int(math.ceil((len(queens) + 1)/2.0))
+            log.info("got votes", count = num_votes, needed=votes_needed, term=raft_term)
             # Check to see if we have a majority of votes
-            if num_votes > int(math.ceil(len(queens)/2.0)):
+            if num_votes > votes_needed:
                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.LEADER))
                 raft_state = RaftState.LEADER
-
+            else:
+                log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
+                raft_state = RaftState.FOLLOWER
         if raft_state == RaftState.LEADER:
             log.info("doing raft task", task="leader heartbeat")
             do_list_threaded(send_heartbeat_thread, queens)
@@ -201,9 +215,14 @@ def send_vote_request_thread(voter_queen, idx, ret_list):
 
 
 def send_vote_request(voter_queen):
-    log.info("sending vote request", queen=voter_queen)
+    global raft_term
+
+    log.info("sending vote request", queen=voter_queen, term=raft_term)
     self_ip = get_ip_of_interface(interface)
-    payload = {"candidate": self_ip + ":" + str(args.port)}
+    payload = {
+            "candidate": self_ip + ":" + str(args.port),
+            "term" : raft_term
+            }
     headers = {'Content-Type': 'application/json'}
 
     try:
@@ -236,15 +255,29 @@ def send_vote_request(voter_queen):
 @app.route('/request_vote', methods=['POST'])
 def request_vote():
     global last_heartbeat
+    global raft_term
+    global raft_lock
 
     last_heartbeat = int(time.time())
 
     if not request.json or not 'candidate' in request.json:
         abort(400)
 
-    log.info("got request for vote", candidate=request.json.get('candidate'))
+    if not request.json or not 'term' in request.json:
+        abort(400)
 
-    return jsonify({'result': 'OK'})
+    candidate = request.json.get('candidate')
+    term = request.json.get('term')
+
+    raft_lock.acquire()
+    log.info("got request for vote", candidate=candidate, term=term, current_term=raft_term)
+    if term > raft_term:
+        raft_term = term
+        raft_lock.release()
+        return jsonify({'result': 'OK'})
+
+    raft_lock.release()
+    return Response("{'reason': 'invalid term'}", status=300, mimetype='application/json')
 
 
 # Submit a task to the queen to be assigned to a drone
