@@ -45,10 +45,6 @@ class RaftState(Enum):
     LEADER = 3
 
 
-# The unix time (in seconds) we last heard from someone
-last_heartbeat = int(time.time())
-
-
 # Create the Flask API server
 app = Flask(__name__)
 
@@ -62,7 +58,7 @@ larve_verson = '0.0.1'
 interface = ""
 
 # Our leader timeout is anywhere between 5 and 15 seconds
-raft_election_timeout = random.randint(5, 15)
+raft_election_timeout = random.randint(150, 300)
 raft_state = RaftState.FOLLOWER
 raft_term = 0
 raft_lock = threading.Lock()
@@ -75,6 +71,14 @@ drones_lock = threading.Lock()
 queens = []
 
 
+def get_time_millis():
+    return int(round(time.time() * 1000))
+
+
+# The unix time (in seconds) we last heard from someone
+last_heartbeat = get_time_millis()
+
+
 # Function for the heartbeat thread
 def queen_heartbeat():
     global drones
@@ -84,7 +88,6 @@ def queen_heartbeat():
     # We always want to be heartbeating
     while True:
         if raft_state == RaftState.LEADER:
-            log.info("starting task", task="drone heartbeat")
             drones_lock.acquire()
             to_remove = []
             for k, v in drones.items():
@@ -113,7 +116,6 @@ def queen_heartbeat():
                 drones.pop(r, None)
 
             drones_lock.release()
-            log.info("completed task", task="drone heartbeat")
         time.sleep(10)
 
 
@@ -122,40 +124,49 @@ def raft():
     global raft_term
     global raft_lock
     global last_heartbeat
+    global raft_election_timeout
 
     # We're always doing raft
     while True:
 
         if raft_state == RaftState.FOLLOWER:
-            if (int(time.time()) - last_heartbeat) > raft_election_timeout:
+            if (get_time_millis() - last_heartbeat) > raft_election_timeout:
                 raft_state = RaftState.CANDIDATE
                 log.info("Changing raft state", previous=str(RaftState.FOLLOWER), next=str(RaftState.CANDIDATE))
             else:
-                time.sleep(1)
+                time.sleep(10/1000.0)
 
         if raft_state == RaftState.CANDIDATE:
             log.info("starting vote pool")
+            raft_election_timeout = random.randint(150,300)
             raft_lock.acquire()
             raft_term = raft_term + 1
             raft_lock.release()
             num_votes = sum(do_list_threaded(send_vote_request_thread, queens))
             # Vote for ourselves
             num_votes = num_votes + 1
-            last_heartbeat = int(time.time())
+            last_heartbeat = get_time_millis()
             votes_needed = int(math.ceil((len(queens) + 1)/2.0))
             log.info("got votes", count = num_votes, needed=votes_needed, term=raft_term)
+
+            # If we had aborted the election early, then we can ignore all our votes
+            raft_lock.acquire()
+            if raft_state == RaftState.FOLLOWER:
+                num_votes = 0
+            raft_lock.release()
+
             # Check to see if we have a majority of votes
+            raft_lock.acquire()
             if num_votes > votes_needed:
                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.LEADER))
                 raft_state = RaftState.LEADER
             else:
                 log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
                 raft_state = RaftState.FOLLOWER
+            raft_lock.release()
         if raft_state == RaftState.LEADER:
-            log.info("doing raft task", task="leader heartbeat")
-            do_list_threaded(send_heartbeat_thread, queens)
-            log.info("completed raft task", task="leader heartbeat")
-            time.sleep(3)
+            do_list_threaded(send_append_entries_thread, queens)
+            time.sleep(100/1000.0)
 
 
 def do_list_threaded(func, to_do):
@@ -190,7 +201,7 @@ def healthz():
     global drones
     global last_heartbeat
 
-    last_heartbeat = int(time.time())
+    last_heartbeat = get_time_millis()
 
     current_health = {
         "status": str(larve_status),
@@ -207,6 +218,63 @@ def healthz():
 
 
     return jsonify(current_health)
+
+
+def send_append_entries_thread(host, idx, ret_list):
+     send_append_entries(host)
+
+
+def send_append_entries(host):
+    self_ip = get_ip_of_interface(interface)
+    payload = {
+        "leader": self_ip + ":" + str(args.port),
+        "term": raft_term,
+        "entries": []
+        }
+    headers = {'Content-Type': 'application/json'}
+    try:
+        requests.post('http://' + host + '/append_entries',
+                             headers=headers,
+                             data=json.dumps(payload))
+    except Exception as e:
+        pass
+
+
+@app.route('/append_entries', methods=['POST'])
+def append_entries():
+    global raft_term
+    global raft_state
+    global raft_lock
+    global last_heartbeat
+
+    if not request.json or not 'leader' in request.json:
+        abort(400)
+    if not request.json or not 'term' in request.json:
+        abort(400)
+    if not request.json or not 'entries' in request.json:
+        abort(400)
+
+    raft_lock.acquire()
+    if raft_state == RaftState.CANDIDATE:
+        # We are a candidate and we got an append entries
+        entry_term = int(request.json.get('term'))
+        leader = request.json.get('leader')
+        if entry_term >= raft_term:
+            log.info("Aborting candidate state", term=entry_term, leader=leader)
+            last_heartbeat = get_time_millis()
+            raft_term = entry_term
+            raft_state = RaftState.FOLLOWER
+            log.info("Changing raft state", previous=str(RaftState.CANDIDATE), next=str(RaftState.FOLLOWER))
+            raft_lock.release()
+            return jsonify({'result': 'OK'})
+        else:
+            raft_lock.release()
+            abort(400)
+
+    # If we had entries, do stuff with them here
+    last_heartbeat = get_time_millis()
+    raft_lock.release()
+    return jsonify({'result': 'OK'})
 
 
 def send_vote_request_thread(voter_queen, idx, ret_list):
@@ -258,7 +326,7 @@ def request_vote():
     global raft_term
     global raft_lock
 
-    last_heartbeat = int(time.time())
+    last_heartbeat = get_time_millis()
 
     if not request.json or not 'candidate' in request.json:
         abort(400)
